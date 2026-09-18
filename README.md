@@ -95,6 +95,63 @@ rather than letting it provision a new empty one. An empty directory deliberatel
 creates a new garden, while an unreadable or corrupt existing database fails
 startup; errors never trigger an automatic reset.
 
+### OpenShift to VKS: adapt the destination security context
+
+The OpenShift manifest intentionally leaves the UID and fsGroup unspecified.
+OpenShift SCC admission supplies these on the created Pod; they are not normally
+written back into the Deployment's pod template. Restoring that Deployment on
+VKS does not reproduce OpenShift's admission defaults. The stock Python image
+defaults to root, so `runAsNonRoot: true` alone produces:
+
+```text
+Error: container has runAsNonRoot and image will run as root
+```
+
+After the destination PVC is bound to the migrated data, patch only the existing
+destination Deployment (make sure your kubectl context points to VKS):
+
+```bash
+kubectl -n turtle-demo patch deployment turtle --type=merge \
+  --patch-file patches/vks-security-context.yaml
+kubectl -n turtle-demo rollout status deployment/turtle
+kubectl -n turtle-demo logs deployment/turtle --tail=20
+```
+
+The template update triggers replacement automatically. This leaves the
+Deployment's volume reference, PVC binding, image, ConfigMap and Service intact.
+Do not reapply the full fresh-install manifest over an adopted PVC to fix this
+error: migration may have changed the volume mapping and storage configuration.
+
+The patch explicitly chooses UID/GID 10001 and requests fsGroup 10001 with
+`fsGroupChangePolicy: Always`. For supported CSI filesystems, volume ownership
+handling gives that group write access to existing data as well as the mount
+directory. `Always` requests a recursive check even when the root directory
+already matches. This can alter group ownership/mode bits on existing files; it
+does not reset the database or require root in the application container.
+The default fresh-install manifest can continue using `OnRootMismatch`.
+
+Volume ownership behaviour depends on the CSI driver: when the driver performs
+the group handling itself, Kubernetes' `fsGroupChangePolicy` does not apply.
+If the app next reports a permission error, inspect its logs and the driver's
+fsGroup support; do not disable `runAsNonRoot` as a workaround. For a migration
+that must retain ownership unchanged, an alternative is to capture the source
+Pod's effective UID/GIDs before quiescing and use those explicitly on VKS, subject
+to destination security policy. This patch deliberately uses the demo's standard
+VKS identity instead.
+
+Verify after startup:
+
+```bash
+kubectl -n turtle-demo exec deployment/turtle -- id
+kubectl -n turtle-demo exec deployment/turtle -- \
+  stat -c '%u:%g %a %n' /data /data/turtle.db /data/writer.lock
+```
+
+The logs should say `Opened garden ...` with the saved counters, followed by
+`COMMITTED ...`. Check that the browser shows the original garden ID and lettuce
+total. Apply this patch only to the VKS destination, not the source OpenShift
+Deployment, whose namespace may not permit UID 10001.
+
 ## What is actually written
 
 - The server moves one maze cell per iteration, with a default 1-second wait
@@ -188,6 +245,8 @@ daemon was available here; downloading a browser was unsuccessful.
 - `build_manifests.py`: regenerates those manifests without dependencies.
 - `Dockerfile`: optional image packaging.
 - `tests/test_persistence.py`: integration tests.
+- `patches/vks-security-context.yaml`: destination-only security adaptation after
+  restoring an OpenShift Deployment to VKS (use `kubectl patch`).
 
 Delete the Deployment to stop the demo while preserving the PVC. Deleting the
 namespace/PVC may delete the underlying volume according to its reclaim policy.

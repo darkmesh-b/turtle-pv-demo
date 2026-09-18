@@ -1,0 +1,11 @@
+# Merge patch for the existing destination Deployment.
+# Apply with kubectl patch, not kubectl apply.
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        fsGroupChangePolicy: Always
